@@ -1,0 +1,8 @@
+/target
+
+justfile
+/bundle-*
+bundle*
+/hack
+/operator
+.env

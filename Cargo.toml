@@ -1,0 +1,56 @@
+
+[package]
+name = "vault-sync"
+version = "0.1.0"
+edition = "2021"
+
+
+[[bin]]
+doc = false
+name = "crdgen"
+path = "src/crdgen.rs"
+
+[[bin]]
+doc = false
+name = "vault-sync"
+path = "src/main.rs"
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[dependencies]
+kube = { version = "0.72", features = [
+    "runtime",
+    "derive",
+    "admission",
+    "rustls-tls"
+] }
+k8s-openapi = { version = "0.14.0", features = ["v1_22"] }
+tokio = { version = "1.14.0", features = ["full"] }
+chrono = "*"
+
+futures = "0.3.21"
+clap = { version = "3", default-features = false, features = ["derive", "env", "std"] }
+
+color-eyre = "0.6.1"
+
+opentelemetry = { version = "0.17", features = ["rt-tokio-current-thread"] }
+# opentelemetry-jaeger = { version = "0.16", features = ["rt-tokio-current-thread", "reqwest_collector_client"] }
+opentelemetry-zipkin = {version = "0.15", features = ["reqwest-client"], default-features = false}
+tracing = "0.1.34"
+tracing-opentelemetry = { version = "0.17" }
+tracing-bunyan-formatter = "0.3"
+tracing-subscriber = { version = "0.3.11", features = ["registry", "env-filter"] }
+
+regex = "1.5.5"
+
+serde_json = "*"
+serde = "*"
+thiserror = "*"
+anyhow = "*"
+schemars = "0.8.6"
+
+serde_yaml = "0.8.24"
+vaultrs = "0.6.0"
+vaultrs-login = "0.1.5"
+reqwest = "*"
+base64 = "0.13.0"

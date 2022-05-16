@@ -247,7 +247,7 @@ async fn reconcile(generator: Arc<VaultSecret>, ctx: Context<Data>) -> Result<Ac
                 let new_status = Patch::Apply(json!({
                     "apiVersion": "vault-sync.eda.io/v1",
                     "kind": "VaultSecret",
-                    "status": VaultSecretStatus {sync_status: Some("Success".to_string()), trace_id:  None}
+                    "status": VaultSecretStatus {sync_status: Some("Success".to_string())}
                 }));
                 let ps = PatchParams::apply("vault-syncer.kube-rt.vault-sync.io").force();
                 let _vsp = vault_secrets
@@ -260,11 +260,12 @@ async fn reconcile(generator: Arc<VaultSecret>, ctx: Context<Data>) -> Result<Ac
                 // throw an event
                 let reporter = ctx.get_ref().state.read().await.reporter.clone();
                 let recorder = Recorder::new(client.clone(), reporter, generator.object_ref(&()));
+                let current_span = tracing::span::Span::current();
                 recorder
                     .publish(Event {
                         type_: EventType::Warning,
                         reason: "UpdateSecret".into(),
-                        note: Some(format!("Error: {:?}", e)),
+                        note: Some(format!("Error: {:?} \n trace: {:?}", e, current_span.id())),
                         action: "Reconciling".into(),
                         secondary: secret.map(|s| s.object_ref(&())),
                     })
@@ -276,11 +277,11 @@ async fn reconcile(generator: Arc<VaultSecret>, ctx: Context<Data>) -> Result<Ac
                     Api::namespaced(client.clone(), target_namespace);
                 // TODO: fix this so it doesn't hot loop if we provide a `trace_id`
                 // can we provide just the first trace_id for a string of failures to make the reconcile idempotent?
-                // let current_span = tracing::span::Span::current();
+                
                 let new_status = Patch::Apply(json!({
                     "apiVersion": "vault-sync.eda.io/v1",
                     "kind": "VaultSecret",
-                    "status": VaultSecretStatus {sync_status: Some("Failed".to_string()), trace_id: None }//trace_id: Some(format!("{:?}", current_span.id())) }
+                    "status": VaultSecretStatus {sync_status: Some("Failed".to_string())}
                 }));
                 let ps = PatchParams::apply("vault-syncer.kube-rt.vault-sync.io").force();
                 let _vsp = vault_secrets

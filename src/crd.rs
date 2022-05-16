@@ -24,6 +24,8 @@ pub enum Error {
     EventWrite(#[source] kube::Error),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+    #[error("The namespace you are targeting: {0} is not allowed by your creds!")]
+    VaultNamespaceNotAllowed(String),
 }
 
 #[derive(CustomResource, Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -58,7 +60,8 @@ pub struct SecretTarget {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct VaultSecretStatus {
-    pub last_refresh_time: Option<String>,
+    pub sync_status: Option<String>,
+    pub trace_id: Option<String>
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

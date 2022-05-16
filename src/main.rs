@@ -3,7 +3,7 @@
 mod crd;
 mod telemetry;
 
-use crd::{Error, VaultSecret};
+use crd::{Error, VaultSecret, VaultSecretStatus};
 
 use anyhow::Result;
 use chrono::prelude::*;
@@ -19,11 +19,9 @@ use kube::{
     Client, Resource,
 };
 use serde::Serialize;
+use serde_json::json;
 
-use std::{
-    collections::{BTreeMap},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 use tokio::{sync::RwLock, time};
 use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
 use tracing_subscriber::Registry;
@@ -51,12 +49,10 @@ fn should_update(secret: Option<Secret>, refresh_interval: i64) -> bool {
     if let Some(s) = secret {
         let fields = s.metadata.managed_fields;
         if let Some(f) = fields {
-            let latest = f
-                .iter()
-                .find(|x| {
-                    x.manager == Some("vault-syncer.kube-rt.vault-sync.io".to_string())
-                        && x.operation == Some("Apply".to_string())
-                });
+            let latest = f.iter().find(|x| {
+                x.manager == Some("vault-syncer.kube-rt.vault-sync.io".to_string())
+                    && x.operation == Some("Apply".to_string())
+            });
             if let Some(e) = latest {
                 if let Some(t) = &e.time {
                     t.0 + chrono::Duration::seconds(refresh_interval) <= Utc::now()
@@ -76,24 +72,148 @@ fn should_update(secret: Option<Secret>, refresh_interval: i64) -> bool {
     }
 }
 
-fn load_vault_secret(secret: Secret) -> Result<(String, String, String)> {
+struct VaultConf {
+    address: String,
+    role_id: String,
+    secret_id: String,
+    allowed_namespaces: Vec<String>,
+}
+
+fn load_vault_secret(secret: Secret) -> Result<VaultConf> {
     if let Some(bd) = secret.data {
-        let vault_address = bd
+        let address = bd
             .get("VAULT_ADDR")
             .map(|x| String::from_utf8(x.clone().0).unwrap())
             .unwrap();
-        let vault_role_id = bd
+        let role_id = bd
             .get("VAULT_APPROLE_ID")
             .map(|x| String::from_utf8(x.clone().0).unwrap())
             .unwrap();
-        let vault_secret_id = bd
+        let secret_id = bd
             .get("VAULT_SECRET_ID")
             .map(|x| String::from_utf8(x.clone().0).unwrap())
             .unwrap();
-        Ok((vault_address, vault_role_id, vault_secret_id))
+        let allowed_namespaces = bd
+            .get("ALLOWED_TARGET_NAMESPACES")
+            .map(|x| String::from_utf8(x.clone().0).unwrap())
+            .unwrap_or_else(|| "".to_string())
+            .split(",")
+            .map(|s| s.to_owned())
+            .collect();
+        
+        Ok(VaultConf {
+            address,
+            role_id,
+            secret_id,
+            allowed_namespaces,
+        })
     } else {
         panic!("Nope!")
     }
+}
+
+#[tracing::instrument(skip(ctx, generator), fields(trace_id))]
+async fn patch_secret(generator: Arc<VaultSecret>, ctx: Context<Data>) -> Result<(), Error> {
+    let target_namespace = generator
+        .metadata
+        .namespace
+        .as_ref()
+        .ok_or(Error::MissingObjectKey(".metadata.namespace"))?;
+    let client = ctx.get_ref().client.clone();
+    let mount = generator.spec.vault.source.mount.as_ref();
+    let key = generator.spec.vault.source.key.as_ref();
+
+    let reporter = ctx.get_ref().state.read().await.reporter.clone();
+    let recorder = Recorder::new(client.clone(), reporter, generator.object_ref(&()));
+    let target_secret_api = Api::<Secret>::namespaced(client.clone(), target_namespace);
+
+    let secret = target_secret_api
+        .get_opt(&generator.spec.target.name)
+        .await
+        .map_err(Error::SecretAccessFailed)?;
+
+    // only send event if a secret is being synced
+    recorder
+        .publish(Event {
+            type_: EventType::Normal,
+            reason: "UpdateSecret".into(),
+            note: Some(format!("Updating secret: {}", &generator.spec.target.name)),
+            action: "Reconciling".into(),
+            secondary: secret.map(|s| s.object_ref(&())),
+        })
+        .await
+        .map_err(Error::EventWrite)?;
+
+    // look up the data we need from vault to get access to our secret.
+    let source_creds_secret_api = Api::<Secret>::namespaced(
+        client.clone(),
+        generator.spec.vault.creds.namespace.as_ref(),
+    );
+    let vault_access_secret = source_creds_secret_api
+        .get(generator.spec.vault.creds.name.as_ref())
+        .await
+        .map_err(Error::VaultSecretRetrieval)?;
+
+    let vault_conf =
+        load_vault_secret(vault_access_secret).map_err(Error::Other)?;
+
+    // check and make sure the namespace is 'allowed' to be targeted by the creds
+    // to prevent a snooping attack 
+    if !vault_conf.allowed_namespaces.contains(target_namespace) {
+        tracing::error!("Not allowed! Cross-namespace access was not allowlisted!");
+        return Err(Error::VaultNamespaceNotAllowed(target_namespace.to_owned()))
+    } else {
+        tracing::info!("Access is allowed for this cred/target pair.")
+    }
+    // actually get our vault data
+    let data = get_secret(vault_conf, mount, key)
+        .await
+        .map_err(Error::VaultRetrieval)?;
+
+    let labels = if let Some(l) = &mut generator.metadata.labels.clone() {
+        l.insert(
+            "app.kubernetes.io/managed-by".to_string(),
+            "vault-sync".to_string(),
+        );
+        Some(l.to_owned())
+    } else {
+        let mut l: BTreeMap<String, String> = BTreeMap::new();
+        l.insert(
+            "app.kubernetes.io/managed-by".to_string(),
+            "vault-sync".to_string(),
+        );
+        Some(l.to_owned())
+    };
+
+    let secret: Secret = Secret {
+        data: None,
+        immutable: Some(true),
+        metadata: ObjectMeta {
+            name: Some(generator.spec.target.name.clone()),
+            namespace: Some(target_namespace.to_string()),
+            owner_references: Some(vec![generator.controller_owner_ref(&()).unwrap()]),
+            labels,
+            annotations: generator.metadata.annotations.clone(),
+            ..ObjectMeta::default()
+        },
+        string_data: Some(data),
+        type_: Some("Opaque".to_string()),
+    };
+
+    target_secret_api
+        .patch(
+            secret
+                .metadata
+                .name
+                .as_ref()
+                .ok_or(Error::MissingObjectKey(".metadata.name"))?,
+            &PatchParams::apply("vault-syncer.kube-rt.vault-sync.io"),
+            &Patch::Apply(&secret),
+        )
+        .await
+        .map_err(Error::SecretCreationFailed)?;
+
+    Ok(())
 }
 
 #[tracing::instrument(skip(ctx, generator), fields(trace_id))]
@@ -105,109 +225,73 @@ async fn reconcile(generator: Arc<VaultSecret>, ctx: Context<Data>) -> Result<Ac
         .as_ref()
         .ok_or(Error::MissingObjectKey(".metadata.namespace"))?;
 
-    // let vault_secrets: Api<VaultSecret> = Api::namespaced(client.clone(), target_namespace);
-
-    let mount = generator.spec.vault.source.mount.as_ref();
-    let key = generator.spec.vault.source.key.as_ref();
-
-    let reporter = ctx.get_ref().state.read().await.reporter.clone();
-    let recorder = Recorder::new(client.clone(), reporter, generator.object_ref(&()));
+    let name = generator
+        .metadata
+        .name
+        .as_ref()
+        .ok_or(Error::MissingObjectKey(".metadata.name"))?;
 
     // let name = ResourceExt::name(generator.as_ref());
-
     let target_secret_api = Api::<Secret>::namespaced(client.clone(), target_namespace);
-
     let secret = target_secret_api
         .get_opt(&generator.spec.target.name)
         .await
         .map_err(Error::SecretAccessFailed)?;
 
     if should_update(secret.clone(), generator.spec.refresh_interval) {
-        // only send event if a secret is being synced
-        recorder
-            .publish(Event {
-                type_: EventType::Normal,
-                reason: "UpdateSecret".into(),
-                note: Some(format!("Updating secret: {}", &generator.spec.target.name)),
-                action: "Reconciling".into(),
-                secondary:  secret.map(|s| s.object_ref(&())),
-            })
-            .await
-            .map_err(Error::EventWrite)?;
+        let res = patch_secret(generator.clone(), ctx.clone()).await;
+        match res {
+            Ok(_) => {
+                let vault_secrets: Api<VaultSecret> =
+                    Api::namespaced(client.clone(), target_namespace);
+                let new_status = Patch::Apply(json!({
+                    "apiVersion": "vault-sync.eda.io/v1",
+                    "kind": "VaultSecret",
+                    "status": VaultSecretStatus {sync_status: Some("Success".to_string()), trace_id:  None}
+                }));
+                let ps = PatchParams::apply("vault-syncer.kube-rt.vault-sync.io").force();
+                let _vsp = vault_secrets
+                    .patch_status(name, &ps, &new_status)
+                    .await
+                    .map_err(Error::StatusPatchFailed)?;
+            }
+            Err(e) => {
+                tracing::error!("Error patching secret {:?}", e);
+                // throw an event
+                let reporter = ctx.get_ref().state.read().await.reporter.clone();
+                let recorder = Recorder::new(client.clone(), reporter, generator.object_ref(&()));
+                recorder
+                    .publish(Event {
+                        type_: EventType::Warning,
+                        reason: "UpdateSecret".into(),
+                        note: Some(format!("Error: {:?}", e)),
+                        action: "Reconciling".into(),
+                        secondary: secret.map(|s| s.object_ref(&())),
+                    })
+                    .await
+                    .map_err(Error::EventWrite)?;
 
-        // look up the data we need from vault to get access to our secret.
-        let source_creds_secret_api = Api::<Secret>::namespaced(
-            client.clone(),
-            generator.spec.vault.creds.namespace.as_ref(),
-        );
-        let vault_access_secret = source_creds_secret_api
-            .get(generator.spec.vault.creds.name.as_ref())
-            .await
-            .map_err(Error::VaultSecretRetrieval)?;
+                // update the CR w/ the status
+                let vault_secrets: Api<VaultSecret> =
+                    Api::namespaced(client.clone(), target_namespace);
+                // TODO: fix this so it doesn't hot loop if we provide a `trace_id`
+                // can we provide just the first trace_id for a string of failures to make the reconcile idempotent?
+                // let current_span = tracing::span::Span::current();
+                let new_status = Patch::Apply(json!({
+                    "apiVersion": "vault-sync.eda.io/v1",
+                    "kind": "VaultSecret",
+                    "status": VaultSecretStatus {sync_status: Some("Failed".to_string()), trace_id: None }//trace_id: Some(format!("{:?}", current_span.id())) }
+                }));
+                let ps = PatchParams::apply("vault-syncer.kube-rt.vault-sync.io").force();
+                let _vsp = vault_secrets
+                    .patch_status(name, &ps, &new_status)
+                    .await
+                    .map_err(Error::StatusPatchFailed)?;
 
-        let (vault_address, vault_role_id, vault_secret_id) =
-            load_vault_secret(vault_access_secret).map_err(Error::Other)?;
-
-        let data = get_secret(&vault_address, vault_role_id, vault_secret_id, mount, key)
-            .await
-            .map_err(Error::VaultRetrieval)?;
-
-        let labels = if let Some(l) = &mut generator.metadata.labels.clone() {
-            l.insert(
-                "app.kubernetes.io/managed-by".to_string(),
-                "vault-sync".to_string(),
-            );
-            Some(l.to_owned())
-        } else {
-            let mut l: BTreeMap<String, String> = BTreeMap::new();
-            l.insert(
-                "app.kubernetes.io/managed-by".to_string(),
-                "vault-sync".to_string(),
-            );
-            Some(l.to_owned())
-        };
-
-        let secret: Secret = Secret {
-            data: None,
-            immutable: Some(true),
-            metadata: ObjectMeta {
-                name: Some(generator.spec.target.name.clone()),
-                namespace: Some(target_namespace.to_string()),
-                owner_references: Some(vec![generator.controller_owner_ref(&()).unwrap()]),
-                labels,
-                annotations: generator.metadata.annotations.clone(),
-                ..ObjectMeta::default()
-            },
-            string_data: Some(data),
-            type_: Some("Opaque".to_string()),
-        };
-
-        target_secret_api
-            .patch(
-                secret
-                    .metadata
-                    .name
-                    .as_ref()
-                    .ok_or(Error::MissingObjectKey(".metadata.name"))?,
-                &PatchParams::apply("vault-syncer.kube-rt.vault-sync.io"),
-                &Patch::Apply(&secret),
-            )
-            .await
-            .map_err(Error::SecretCreationFailed)?;
+                return Ok(Action::await_change());
+            }
+        }
     }
-
-    // let new_status = Patch::Apply(json!({
-    //     "apiVersion": "vault-sync.eda.io/v1",
-    //     "kind": "VaultSecret",
-    //     "status": VaultSecretStatus {
-    //         last_refresh_time: Some(Utc::now().to_string())
-    //     }
-    // }));
-    // let ps = PatchParams::apply("vault-syncer.kube-rt.vault-sync.io").force();
-    // let vsp = vault_secrets
-    //     .patch_status(&name, &ps, &new_status)
-    //     .await
-    //     .map_err(Error::StatusPatchFailed)?;
 
     // TODO: properly error handle this
     Ok(Action::requeue(tokio::time::Duration::from_secs(
@@ -271,18 +355,16 @@ async fn main() -> Result<()> {
 }
 
 async fn get_secret(
-    address: &str,
-    role_id: String,
-    secret_id: String,
+    conf: VaultConf,
     mount: &str,
     path: &str,
 ) -> Result<BTreeMap<String, String>, anyhow::Error> {
     let mut client = VaultClient::new(
         VaultClientSettingsBuilder::default()
-            .address(address)
+            .address(conf.address)
             .build()?,
     )?;
-    let login = AppRoleLogin { role_id, secret_id };
+    let login = AppRoleLogin { role_id: conf.role_id, secret_id: conf.secret_id };
     client.login("approle", &login).await?;
     // Token is automatically set to cli
     use vaultrs::kv2;
@@ -295,12 +377,11 @@ struct Data {
     state: Arc<RwLock<State>>,
 }
 
-/// TODO: write an event somewhere else, maybe the namespace API?
 /// TODO: exponential backoff?
 ///    - https://docs.rs/backoff/0.4.0/backoff/backoff/trait.Backoff.html#tymethod.next_backoff
 fn error_policy(error: &Error, _ctx: Context<Data>) -> Action {
     tracing::error!("Error occured: {}", error);
-    Action::requeue(tokio::time::Duration::from_secs(30))
+    Action::await_change()
 }
 
 #[derive(Copy, Clone, Debug)]

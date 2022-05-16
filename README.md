@@ -8,8 +8,6 @@ The [External Secrets Operator](https://external-secrets.io/) requires too many 
 
 With this approach the Operator can be 'opted-in' to management of a select set of namespaces, each independently syncing secrets via their own team keys.
 
-
-
 ### `VaultSecret` CR
 
 ```yaml
@@ -19,7 +17,7 @@ kind: VaultSecret
 metadata:
   name: example-vault-sync
 spec:
-  refresh_interval: 30
+  refreshInterval: 30
   target:
     name: my-secret-target
   vault:
@@ -29,9 +27,7 @@ spec:
     source:
       key: path/to/my/teams/vault
       mount: apps/ # custom mount mount if required
-status:
-  sync_status: Failed
-  trace_id: null
+status: {}
 ```
 
 ### Secret Specification

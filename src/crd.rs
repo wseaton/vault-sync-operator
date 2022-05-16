@@ -35,6 +35,7 @@ pub enum Error {
 pub struct VaultSecretSpec {
     /// Schedule in cron-style syntax
     pub vault: VaultDetails,
+    #[serde(rename = "refreshInterval")]
     pub refresh_interval: i64,
     pub target: SecretTarget,
 }
@@ -60,7 +61,11 @@ pub struct SecretTarget {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct VaultSecretStatus {
+    #[serde(rename = "syncStatus")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_status: Option<String>,
+    #[serde(rename = "traceId")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>
 }
 

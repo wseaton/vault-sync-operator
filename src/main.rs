@@ -244,7 +244,7 @@ async fn reconcile(generator: Arc<VaultSecret>, ctx: Context<Data>) -> Result<Ac
                 let vault_secrets: Api<VaultSecret> =
                     Api::namespaced(client.clone(), target_namespace);
                 let new_status = Patch::Apply(json!({
-                    "apiVersion": "vault-sync.eda.io/v1",
+                    "apiVersion": "vault-sync.io/v1",
                     "kind": "VaultSecret",
                     "status": VaultSecretStatus {sync_status: Some("Success".to_string())}
                 }));
@@ -275,7 +275,7 @@ async fn reconcile(generator: Arc<VaultSecret>, ctx: Context<Data>) -> Result<Ac
                 let vault_secrets: Api<VaultSecret> =
                     Api::namespaced(client.clone(), target_namespace);
                 let new_status = Patch::Apply(json!({
-                    "apiVersion": "vault-sync.eda.io/v1",
+                    "apiVersion": "vault-sync.io/v1",
                     "kind": "VaultSecret",
                     "status": VaultSecretStatus {sync_status: Some("Failed".to_string())}
                 }));
@@ -359,6 +359,7 @@ async fn get_secret(
     let mut client = VaultClient::new(
         VaultClientSettingsBuilder::default()
             .address(conf.address)
+            .verify(false) // #FIXME: add external config for this, probably a CLI flag
             .build()?,
     )?;
     let login = AppRoleLogin {

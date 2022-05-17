@@ -29,7 +29,7 @@ pub enum Error {
 }
 
 #[derive(CustomResource, Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[kube(group = "vault-sync.eda.io", version = "v1", kind = "VaultSecret")]
+#[kube(group = "vault-sync.io", version = "v1", kind = "VaultSecret")]
 #[kube(shortname = "vs", namespaced)]
 #[kube(status = "VaultSecretStatus")]
 pub struct VaultSecretSpec {

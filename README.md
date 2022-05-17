@@ -12,7 +12,7 @@ With this approach the Operator can be 'opted-in' to management of a select set 
 
 ```yaml
 
-apiVersion: vault-sync.eda.io/v1
+apiVersion: vault-sync.io/v1
 kind: VaultSecret
 metadata:
   name: example-vault-sync
@@ -45,3 +45,14 @@ stringData:
 type: Opaque
 
 ```
+
+
+
+
+## TODOs
+
+- Liveness/readiness probes
+- Expose vault config to CLI
+  - eg. Private CA support
+- Parameterize some of the OTEL stuff
+- Add more login methods for vault

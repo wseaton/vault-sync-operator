@@ -50,7 +50,7 @@ fn should_update(secret: Option<Secret>, refresh_interval: i64) -> bool {
         let fields = s.metadata.managed_fields;
         if let Some(f) = fields {
             let latest = f.iter().find(|x| {
-                x.manager == Some("vault-syncer.kube-rt.vault-sync.io".to_string())
+                x.manager == Some("vault-syncer.vault-sync.io".to_string())
                     && x.operation == Some("Apply".to_string())
             });
             if let Some(e) = latest {
@@ -100,7 +100,7 @@ fn load_vault_secret(secret: Secret) -> Result<VaultConf> {
             .split(",")
             .map(|s| s.to_owned())
             .collect();
-        
+
         Ok(VaultConf {
             address,
             role_id,
@@ -154,14 +154,13 @@ async fn patch_secret(generator: Arc<VaultSecret>, ctx: Context<Data>) -> Result
         .await
         .map_err(Error::VaultSecretRetrieval)?;
 
-    let vault_conf =
-        load_vault_secret(vault_access_secret).map_err(Error::Other)?;
+    let vault_conf = load_vault_secret(vault_access_secret).map_err(Error::Other)?;
 
     // check and make sure the namespace is 'allowed' to be targeted by the creds
-    // to prevent a snooping attack 
+    // to prevent a snooping attack
     if !vault_conf.allowed_namespaces.contains(target_namespace) {
         tracing::error!("Not allowed! Cross-namespace access was not allowlisted!");
-        return Err(Error::VaultNamespaceNotAllowed(target_namespace.to_owned()))
+        return Err(Error::VaultNamespaceNotAllowed(target_namespace.to_owned()));
     } else {
         tracing::info!("Access is allowed for this cred/target pair.")
     }
@@ -207,7 +206,7 @@ async fn patch_secret(generator: Arc<VaultSecret>, ctx: Context<Data>) -> Result
                 .name
                 .as_ref()
                 .ok_or(Error::MissingObjectKey(".metadata.name"))?,
-            &PatchParams::apply("vault-syncer.kube-rt.vault-sync.io"),
+            &PatchParams::apply("vault-syncer.vault-sync.io"),
             &Patch::Apply(&secret),
         )
         .await
@@ -249,7 +248,7 @@ async fn reconcile(generator: Arc<VaultSecret>, ctx: Context<Data>) -> Result<Ac
                     "kind": "VaultSecret",
                     "status": VaultSecretStatus {sync_status: Some("Success".to_string())}
                 }));
-                let ps = PatchParams::apply("vault-syncer.kube-rt.vault-sync.io").force();
+                let ps = PatchParams::apply("vault-syncer.vault-sync.io").force();
                 let _vsp = vault_secrets
                     .patch_status(name, &ps, &new_status)
                     .await
@@ -275,15 +274,12 @@ async fn reconcile(generator: Arc<VaultSecret>, ctx: Context<Data>) -> Result<Ac
                 // update the CR w/ the status
                 let vault_secrets: Api<VaultSecret> =
                     Api::namespaced(client.clone(), target_namespace);
-                // TODO: fix this so it doesn't hot loop if we provide a `trace_id`
-                // can we provide just the first trace_id for a string of failures to make the reconcile idempotent?
-                
                 let new_status = Patch::Apply(json!({
                     "apiVersion": "vault-sync.eda.io/v1",
                     "kind": "VaultSecret",
                     "status": VaultSecretStatus {sync_status: Some("Failed".to_string())}
                 }));
-                let ps = PatchParams::apply("vault-syncer.kube-rt.vault-sync.io").force();
+                let ps = PatchParams::apply("vault-syncer.vault-sync.io").force();
                 let _vsp = vault_secrets
                     .patch_status(name, &ps, &new_status)
                     .await
@@ -365,7 +361,10 @@ async fn get_secret(
             .address(conf.address)
             .build()?,
     )?;
-    let login = AppRoleLogin { role_id: conf.role_id, secret_id: conf.secret_id };
+    let login = AppRoleLogin {
+        role_id: conf.role_id,
+        secret_id: conf.secret_id,
+    };
     client.login("approle", &login).await?;
     // Token is automatically set to cli
     use vaultrs::kv2;

@@ -47,8 +47,6 @@ type: Opaque
 ```
 
 
-
-
 ## TODOs
 
 - Liveness/readiness probes
@@ -56,3 +54,4 @@ type: Opaque
   - eg. Private CA support
 - Parameterize some of the OTEL stuff
 - Add more login methods for vault
+- Leader election for HA

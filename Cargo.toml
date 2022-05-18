@@ -35,7 +35,9 @@ color-eyre = "0.6.1"
 
 opentelemetry = { version = "0.17", features = ["rt-tokio-current-thread"] }
 # opentelemetry-jaeger = { version = "0.16", features = ["rt-tokio-current-thread", "reqwest_collector_client"] }
-opentelemetry-zipkin = {version = "0.15", features = ["reqwest-client"], default-features = false}
+opentelemetry-otlp = {version = "0.10.0", features = ["http-proto", "reqwest-client"]}
+
+
 tracing = "0.1.34"
 tracing-opentelemetry = { version = "0.17" }
 tracing-bunyan-formatter = "0.3"
@@ -54,3 +56,5 @@ vaultrs = "0.6.0"
 vaultrs-login = "0.1.5"
 reqwest = "*"
 base64 = "0.13.0"
+lazy_static = "1.4.0"
+

@@ -20,6 +20,7 @@ use kube::{
 };
 use serde::Serialize;
 use serde_json::json;
+use tokio::time::Duration;
 
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::{sync::RwLock, time};
@@ -30,10 +31,25 @@ use vaultrs::client::{VaultClient, VaultClientSettingsBuilder};
 use vaultrs_login::engines::approle::AppRoleLogin;
 use vaultrs_login::LoginClient;
 
+use kube_leader_election::{LeaseLock, LeaseLockParams};
+
+use rand::distributions::Alphanumeric;
+use rand::Rng;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::{routing::get, Router};
 use http::StatusCode;
+
+use clap::Parser;
+
+/// Vault operator controller entrypoint
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    /// Port to run metrics server on
+    #[clap(short, long, default_value_t = 3000)]
+    port: u32,
+}
 
 async fn health() -> Result<String, StatusCode> {
     Ok("Healthy!".to_string())
@@ -327,13 +343,18 @@ async fn init_telemetry() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
     init_telemetry().await?;
 
     // service for probes
     let app = Router::new().route("/health", get(health));
-    let server =
-        axum::Server::bind(&"0.0.0.0:3000".parse().unwrap()).serve(app.into_make_service());
+    let server = axum::Server::bind(&format!("0.0.0.0:{}", args.port).parse().unwrap())
+        .serve(app.into_make_service());
 
+    // spawn the webserver for healthcheck in a background thread
+    tokio::task::spawn(async move { server.await });
+    
     let runtime = Client::try_default().await.expect("Create client");
 
     let vs_api = Api::<VaultSecret>::all(runtime.clone());
@@ -360,12 +381,66 @@ async fn main() -> Result<()> {
             }
         });
 
-    tokio::select! {
-        _ = controller => tracing::warn!("controller exited"),
-        _ = server => tracing::info!("axum exited")
+
+    // leader election section
+    let is_leader = Arc::new(AtomicBool::new(false));
+    let le = leader_elect(runtime, is_leader.clone());
+    tokio::task::spawn(async move { le.await });
+    tokio::pin!(controller);
+
+    let mut le_bool = false;
+
+    // loop continously and check the background thread to see if we've been deposed as leader
+    // if so, we stop polling the controler future temporarily.
+    loop {
+        tokio::select! {
+                _ = &mut controller, if le_bool => tracing::info!("Controller has died."),
+                res = get_leader_status(is_leader.clone()) => {
+                    if !res {
+                        le_bool = false;
+                        tracing::info!("Lease not acquired, sleeping.");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    } else {
+                        tracing::info!("We are the leader!");
+                        le_bool = true;
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                }
+        }
     }
 
-    Ok(())
+}
+
+async fn get_leader_status(is_leader: Arc<AtomicBool>) -> bool {
+    is_leader.load(Ordering::Relaxed)
+}
+
+async fn leader_elect(runtime: Client, is_leader: Arc<AtomicBool>) -> ! {
+    // random id part for the sake of simulating something like a pod hash
+    let random: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(7)
+        .map(char::from)
+        .collect();
+    let holder_id = format!("shared-lease-{}", random.to_lowercase());
+    let leadership = LeaseLock::new(
+        runtime.clone(),
+        &std::env::var("INSTALL_NAMESPACE").unwrap_or_else(|_| "default".to_string()), // TODO: parameterize this based on install
+        LeaseLockParams {
+            holder_id,
+            lease_name: "vault-sync-operator".into(),
+            lease_ttl: Duration::from_secs(15),
+        },
+    );
+    loop {
+        match leadership.try_acquire_or_renew().await {
+            Ok(ll) => is_leader.store(ll.acquired_lease, Ordering::Relaxed),
+            Err(err) => tracing::error!("{:?}", err),
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }
 
 async fn get_secret(

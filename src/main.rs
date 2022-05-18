@@ -30,6 +30,15 @@ use vaultrs::client::{VaultClient, VaultClientSettingsBuilder};
 use vaultrs_login::engines::approle::AppRoleLogin;
 use vaultrs_login::LoginClient;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use axum::{routing::get, Router};
+use http::StatusCode;
+
+async fn health() -> Result<String, StatusCode> {
+    Ok("Healthy!".to_string())
+}
+
 /// In-memory reconciler state exposed on /
 #[derive(Clone, Serialize)]
 pub struct State {
@@ -320,12 +329,17 @@ async fn init_telemetry() -> Result<()> {
 async fn main() -> Result<()> {
     init_telemetry().await?;
 
+    // service for probes
+    let app = Router::new().route("/health", get(health));
+    let server =
+        axum::Server::bind(&"0.0.0.0:3000".parse().unwrap()).serve(app.into_make_service());
+
     let runtime = Client::try_default().await.expect("Create client");
 
     let vs_api = Api::<VaultSecret>::all(runtime.clone());
     let s_api: Api<Secret> = Api::<Secret>::all(runtime.clone());
 
-    Controller::new(vs_api, ListParams::default())
+    let controller = Controller::new(vs_api, ListParams::default())
         .owns(
             s_api,
             ListParams::default().labels("app.kubernetes.io/managed-by=vault-sync"),
@@ -344,9 +358,12 @@ async fn main() -> Result<()> {
                 Ok(o) => tracing::info!("reconciled {:?}", o),
                 Err(e) => tracing::error!("reconcile failed: {:?}", e),
             }
-        })
-        .await;
-    tracing::info!("controller terminated");
+        });
+
+    tokio::select! {
+        _ = controller => tracing::warn!("controller exited"),
+        _ = server => tracing::info!("axum exited")
+    }
 
     Ok(())
 }

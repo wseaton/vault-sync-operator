@@ -2,8 +2,10 @@
 
 mod crd;
 mod telemetry;
+mod vault;
 
 use crd::{Error, VaultSecret, VaultSecretStatus};
+use vault::{load_vault_secret, get_secret};
 
 use anyhow::Result;
 use chrono::prelude::*;
@@ -27,9 +29,7 @@ use tokio::sync::RwLock;
 use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
 use tracing_subscriber::Registry;
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, EnvFilter};
-use vaultrs::client::{VaultClient, VaultClientSettingsBuilder};
-use vaultrs_login::engines::approle::AppRoleLogin;
-use vaultrs_login::LoginClient;
+
 
 use kube_leader_election::{LeaseLock, LeaseLockParams};
 
@@ -67,6 +67,11 @@ impl State {
     }
 }
 
+struct Data {
+    client: Client,
+    state: Arc<RwLock<State>>,
+}
+
 /// Function to calculate if we should refresh an instance of a secret or not based on some interval.
 fn should_update(secret: Option<Secret>, refresh_interval: i64) -> bool {
     if let Some(s) = secret {
@@ -92,46 +97,6 @@ fn should_update(secret: Option<Secret>, refresh_interval: i64) -> bool {
     } else {
         tracing::info!("Secret doesn't exist, we need to create it.");
         true
-    }
-}
-
-struct VaultConf {
-    address: String,
-    role_id: String,
-    secret_id: String,
-    allowed_namespaces: Vec<String>,
-}
-
-fn load_vault_secret(secret: Secret) -> Result<VaultConf> {
-    if let Some(bd) = secret.data {
-        let address = bd
-            .get("VAULT_ADDR")
-            .map(|x| String::from_utf8(x.clone().0).unwrap())
-            .unwrap();
-        let role_id = bd
-            .get("VAULT_APPROLE_ID")
-            .map(|x| String::from_utf8(x.clone().0).unwrap())
-            .unwrap();
-        let secret_id = bd
-            .get("VAULT_SECRET_ID")
-            .map(|x| String::from_utf8(x.clone().0).unwrap())
-            .unwrap();
-        let allowed_namespaces = bd
-            .get("ALLOWED_TARGET_NAMESPACES")
-            .map(|x| String::from_utf8(x.clone().0).unwrap())
-            .unwrap_or_else(|| "".to_string())
-            .split(',')
-            .map(|s| s.to_owned())
-            .collect();
-
-        Ok(VaultConf {
-            address,
-            role_id,
-            secret_id,
-            allowed_namespaces,
-        })
-    } else {
-        panic!("Nope!")
     }
 }
 
@@ -352,7 +317,7 @@ async fn main() -> Result<()> {
 
     // spawn the webserver for healthcheck in a background thread
     tokio::task::spawn(async move { server.await });
-    
+
     let runtime = Client::try_default().await.expect("Create client");
 
     let vs_api = Api::<VaultSecret>::all(runtime.clone());
@@ -378,7 +343,6 @@ async fn main() -> Result<()> {
                 Err(e) => tracing::error!("reconcile failed: {:?}", e),
             }
         });
-
 
     // leader election section
     let is_leader = Arc::new(AtomicBool::new(false));
@@ -408,13 +372,14 @@ async fn main() -> Result<()> {
                 }
         }
     }
-
 }
 
 async fn get_leader_status(is_leader: Arc<AtomicBool>) -> bool {
     is_leader.load(Ordering::Relaxed)
 }
 
+/// leader election background thread routine
+/// see caveats here: https://github.com/kubernetes/client-go/blob/30b06a83d67458700a5378239df6b96948cb9160/tools/leaderelection/leaderelection.go#L21-L24
 async fn leader_elect(runtime: Client, is_leader: Arc<AtomicBool>) -> ! {
     let leadership = LeaseLock::new(
         runtime.clone(),
@@ -429,36 +394,11 @@ async fn leader_elect(runtime: Client, is_leader: Arc<AtomicBool>) -> ! {
     loop {
         match leadership.try_acquire_or_renew().await {
             Ok(ll) => is_leader.store(ll.acquired_lease, Ordering::Relaxed),
+            // on failure here, we log, but is it better to actually just kill the pod?
             Err(err) => tracing::error!("{:?}", err),
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-}
-
-async fn get_secret(
-    conf: VaultConf,
-    mount: &str,
-    path: &str,
-) -> Result<BTreeMap<String, String>, anyhow::Error> {
-    let mut client = VaultClient::new(
-        VaultClientSettingsBuilder::default()
-            .address(conf.address)
-            .build()?,
-    )?;
-    let login = AppRoleLogin {
-        role_id: conf.role_id,
-        secret_id: conf.secret_id,
-    };
-    client.login("approle", &login).await?;
-    // Token is automatically set to cli
-    use vaultrs::kv2;
-    let secret: BTreeMap<String, String> = kv2::read(&client, mount, path).await?;
-    Ok(secret)
-}
-
-struct Data {
-    client: Client,
-    state: Arc<RwLock<State>>,
 }
 
 /// TODO: exponential backoff?
@@ -467,4 +407,3 @@ fn error_policy(error: &Error, _ctx: Context<Data>) -> Action {
     tracing::error!("Error occured: {}", error);
     Action::await_change()
 }
-

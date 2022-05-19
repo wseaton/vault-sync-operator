@@ -23,7 +23,7 @@ use serde_json::json;
 use tokio::time::Duration;
 
 use std::{collections::BTreeMap, sync::Arc};
-use tokio::{sync::RwLock, time};
+use tokio::sync::RwLock;
 use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
 use tracing_subscriber::Registry;
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, EnvFilter};
@@ -33,8 +33,6 @@ use vaultrs_login::LoginClient;
 
 use kube_leader_election::{LeaseLock, LeaseLockParams};
 
-use rand::distributions::Alphanumeric;
-use rand::Rng;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::{routing::get, Router};
@@ -122,7 +120,7 @@ fn load_vault_secret(secret: Secret) -> Result<VaultConf> {
             .get("ALLOWED_TARGET_NAMESPACES")
             .map(|x| String::from_utf8(x.clone().0).unwrap())
             .unwrap_or_else(|| "".to_string())
-            .split(",")
+            .split(',')
             .map(|s| s.to_owned())
             .collect();
 
@@ -418,18 +416,12 @@ async fn get_leader_status(is_leader: Arc<AtomicBool>) -> bool {
 }
 
 async fn leader_elect(runtime: Client, is_leader: Arc<AtomicBool>) -> ! {
-    // random id part for the sake of simulating something like a pod hash
-    let random: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(7)
-        .map(char::from)
-        .collect();
-    let holder_id = format!("shared-lease-{}", random.to_lowercase());
     let leadership = LeaseLock::new(
         runtime.clone(),
-        &std::env::var("INSTALL_NAMESPACE").unwrap_or_else(|_| "default".to_string()), // TODO: parameterize this based on install
+        &std::env::var("INSTALL_NAMESPACE").unwrap_or_else(|_| "default".to_string()),
         LeaseLockParams {
-            holder_id,
+            // HOSTNAME should resolve to the unique pod name
+            holder_id: std::env::var("HOSTNAME").expect("We need the $HOSTNAME set!"),
             lease_name: "vault-sync-operator".into(),
             lease_ttl: Duration::from_secs(15),
         },
@@ -451,7 +443,6 @@ async fn get_secret(
     let mut client = VaultClient::new(
         VaultClientSettingsBuilder::default()
             .address(conf.address)
-            .verify(false) // #FIXME: add external config for this, probably a CLI flag
             .build()?,
     )?;
     let login = AppRoleLogin {
@@ -477,35 +468,3 @@ fn error_policy(error: &Error, _ctx: Context<Data>) -> Action {
     Action::await_change()
 }
 
-#[derive(Copy, Clone, Debug)]
-struct Timeout(time::Duration);
-
-#[derive(Copy, Clone, Debug, thiserror::Error)]
-#[error("invalid duration")]
-struct InvalidTimeout;
-
-impl std::str::FromStr for Timeout {
-    type Err = InvalidTimeout;
-
-    fn from_str(s: &str) -> Result<Self, InvalidTimeout> {
-        let re = regex::Regex::new(r"^\s*(\d+)(ms|s|m)?\s*$").expect("duration regex");
-        let cap = re.captures(s).ok_or(InvalidTimeout)?;
-        let magnitude = cap[1].parse().map_err(|_| InvalidTimeout)?;
-        let t = match cap.get(2).map(|m| m.as_str()) {
-            None if magnitude == 0 => time::Duration::from_millis(0),
-            Some("ms") => time::Duration::from_millis(magnitude),
-            Some("s") => time::Duration::from_secs(magnitude),
-            Some("m") => time::Duration::from_secs(magnitude * 60),
-            _ => return Err(InvalidTimeout),
-        };
-        Ok(Self(t))
-    }
-}
-
-async fn _init_timeout<F: Future>(deadline: Option<time::Instant>, future: F) -> Result<F::Output> {
-    if let Some(deadline) = deadline {
-        return time::timeout_at(deadline, future).await.map_err(Into::into);
-    }
-
-    Ok(future.await)
-}
